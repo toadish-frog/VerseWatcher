@@ -66,14 +66,14 @@ class GameLogWatcher:
             self.timer.setInterval(250)  # Faster interval to catch more events
             self.timer.timeout.connect(self.check_file)
 
-            # Death event pattern – using the known working pattern
-            self.death_pattern = re.compile(
-                r"^(?P<timestamp>\S+)\s+\[Notice\]\s+<Actor Death> CActor::Kill:\s+"
-                r"\'(?P<vname>[^\']+)\'\s+\[\d+\]\s+in zone\s+\'(?P<vship>[^\']+)\'\s+"
-                r"killed by\s+\'(?P<kname>[^\']+)\'\s+\[\d+\]\s+using\s+\'(?P<kwep>[^\']+)\'\s+"
-                r"\[[^\]]*\]\s+with damage type\s+\'(?P<dtype>[^\']+)\'\s+from direction x:\s*"
-                r"(?P<dirvecx>[^,]+),\s*y:\s*(?P<dirvecy>[^,]+),\s*z:\s*(?P<dirvecz>[^\s]+)"
-                r"\s+\[Team_ActorTech\]\[Actor\]$"
+            # Death event patterns for Star Citizen 4.6+ (at least the time I started working on this)
+            # Pattern for death inside a ship (ejected from destroyed vehicle)
+            self.death_pattern_ship = re.compile(
+                r"<(?P<timestamp>[^>]+)> \[Notice\] <\[ActorState\] Dead>.*? Actor '(?P<vname>[^']+)' \[\d+\] ejected from zone '(?P<vship>[^']+)'"
+            )
+            # Pattern for death on foot (incapacitated)
+            self.death_pattern_foot = re.compile(
+                r"<(?P<timestamp>[^>]+)> \[Notice\] <UpdateNotificationItem> Notification \"Incapacitated:.*"
             )
 
             self.logger.log_debug(f"GameLogWatcher initialized with game_path: {game_path}")
@@ -303,92 +303,67 @@ class GameLogWatcher:
     def process_line(self, line):
         """Process a single line from the log file and trigger events accordingly."""
         try:
-            # Attempt to match a death event via regex
-            death_match = self.death_pattern.match(line)
-            if death_match:
-                # Only log lines that match an event pattern
+            # Check for different types of death events
+            ship_death_match = self.death_pattern_ship.search(line)
+            foot_death_match = self.death_pattern_foot.search(line)
+
+            event_details = {}
+            vname, kname, kwep, vship, dtype = None, "Unknown", "Unknown", "Unknown", "Unknown"
+            toast_type = "info"
+            log_message = None
+            title = None
+            details = None
+
+            if ship_death_match:
+                event_details = ship_death_match.groupdict()
+                vname = event_details.get("vname")
+                vship = event_details.get("vship")
+                kname = "Environment"
+                kwep = "Destroyed Vehicle"
+                dtype = "Vehicle Collision"
+
+                if vname == self.player_name:
+                    log_message = f"You were ejected from a destroyed vehicle: {vship}"
+                    title = f"☠️ You died in your ship ⚰️"
+                    details = f"Ship: {vship}"
+                    toast_type = "death"
+                else:
+                    log_message = f"{vname} was ejected from a destroyed vehicle: {vship}"
+                    title = f"💀 {vname} died in a ship"
+                    details = f"Ship: {vship}"
+                    if vname in self.party_members:
+                        toast_type = "party"
+
+            elif foot_death_match:
+                event_details = foot_death_match.groupdict()
+                vname = self.player_name # Incapacitated notification is always for the player
+                vship = "On Foot"
+                kname = "Unknown"
+                kwep = "Incapacitated"
+                dtype = "Unknown"
+                
+                log_message = "You are incapacitated. Ask for a rescue!"
+                title = f"☠️ You are incapacitated ⚰️"
+                details = "Time to ask for a rescue!"
+                toast_type = "death"
+
+            if log_message: # If a match was found and processed
                 self.logger.log_debug(f"Event match found: {line[:100]}..." if len(line) > 100 else f"Event match found: {line}")
                 
-                event_details = death_match.groupdict()
-                vname = event_details.get("vname")
-                kname = event_details.get("kname")
-                kwep = event_details.get("kwep")
-                vship = event_details.get("vship")
-                dtype = event_details.get("dtype")
-
-                # Do NOT include any direction information.
-                # Remove the raw direction vector keys if they are present.
-                for vec_key in ["dirvecx", "dirvecy", "dirvecz"]:
-                    event_details.pop(vec_key, None)
-
-                # Add only a timestamp to the event details
+                # Populate event_details for UI update
                 event_details["timestamp"] = datetime.now().strftime("%H:%M:%S")
+                event_details["vname"] = vname
+                event_details["kname"] = kname
+                event_details["kwep"] = kwep
+                event_details["vship"] = vship
+                event_details["dtype"] = dtype
 
-                # Determine if the names are designated as NPC:
-                # Any name containing "NPC" or starting with "PU_" is treated as an NPC.
-                vname_is_npc = ("NPC" in vname) or vname.startswith("PU_")
-                kname_is_npc = ("NPC" in kname) or kname.startswith("PU_")
+                # Log to console and file
+                self.logger.log_kill(vname, kname, kwep, vship, dtype)
+                self.logger.log_event(log_message, event_details)
 
-                # Process different event types
-                if vname == kname:
-                    # Suicide event
-                    self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                    self.logger.log_event(f"{vname} committed suicide using {kwep}", event_details)
-                    title = f"💀 {vname} committed suicide 🔫"
-                    details = f"🔫 Weapon: {kwep}\n🚀 Ship: {vship}\n💥 Damage: {dtype}"
-                    self.toast_manager.show_death_toast({"title": title, "details": details}, "suicide")
-                    
-                elif vname_is_npc or kname_is_npc:
-                    # NPC event
-                    if vname_is_npc:
-                        self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                        self.logger.log_event(f"NPC {vname} killed by {kname} using {kwep}", event_details)
-                        title = f"🤖 NPC killed by {kname} ⚔️"
-                    else:
-                        self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                        self.logger.log_event(f"{vname} killed by NPC {kname} using {kwep}", event_details)
-                        title = f"🤖 {vname} killed by NPC ⚔️"
-                    
-                    details = f"🔫 Weapon: {kwep}\n🚀 Ship: {vship}\n💥 Damage: {dtype}"
-                    self.toast_manager.show_death_toast({"title": title, "details": details}, "npc")
-                    
-                elif vname == self.player_name:
-                    # Player death
-                    self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                    self.logger.log_event(f"You were killed by {kname} using {kwep}", event_details)
-                    title = f"☠️ You were killed by {kname} ⚰️"
-                    details = f"🔫 Weapon: {kwep}\n🚀 Ship: {vship}\n💥 Damage: {dtype}"
-                    self.toast_manager.show_death_toast({"title": title, "details": details}, "death")
-                    
-                elif kname == self.player_name:
-                    # Player kill
-                    self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                    self.logger.log_event(f"You killed {vname} using {kwep}", event_details)
-                    title = f"🎯 You killed {vname} ✨"
-                    details = f"🔫 Weapon: {kwep}\n🚀 Ship: {vship}\n💥 Damage: {dtype}"
-                    self.toast_manager.show_death_toast({"title": title, "details": details}, "kill")
-
-                    # Track killstreak notifications
-                    self.kill_counts[self.player_name] = (
-                        self.kill_counts.get(self.player_name, 0) + 1
-                    )
-                    streak = self.kill_counts[self.player_name]
-                    if streak > 1:
-                        self.toast_manager.show_killstreak_toast(
-                            {
-                                "title": f"🔥 KILLSTREAK: {streak} 🏆",
-                                "details": "Keep it up! 🌟",
-                            }
-                        )
-                else:
-                    # Other player kills
-                    self.logger.log_kill(vname, kname, kwep, vship, dtype)
-                    self.logger.log_event(
-                        f"{vname} was killed by {kname} using {kwep}", event_details
-                    )
-                    title = f"⚔️ {vname} killed by {kname} 🎯"
-                    details = f"🔫 Weapon: {kwep}\n🚀 Ship: {vship}\n💥 Damage: {dtype}"
-                    self.toast_manager.show_death_toast({"title": title, "details": details}, "info")
+                # Show toast notification
+                self.toast_manager.show_death_toast({"title": title, "details": details}, toast_type)
 
                 # Notify the main window about the event to update UI
                 if hasattr(self.main_window, 'add_kill_event'):
